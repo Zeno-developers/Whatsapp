@@ -1,0 +1,24 @@
+{
+  "name": "whatsapp-service",
+  "version": "1.0.0",
+  "description": "WhatsApp messaging microservice for GMR",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --ignore .wa_auth/ --ignore wa_qr.png --ignore wa_status.txt --ignore msg_store.json index.js",
+    "prod": "NODE_ENV=production nodemon --ignore .wa_auth/ --ignore wa_qr.png --ignore wa_status.txt --ignore msg_store.json index.js",
+    "install:host": "bash ./scripts/install.sh",
+    "start:host": "bash ./scripts/start.sh"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.23",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "node-cron": "^3.0.3",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
