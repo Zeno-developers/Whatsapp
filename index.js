@@ -1,9 +1,8 @@
 const path = require('path')
 const fs = require('fs')
 
-const envFile = process.env.NODE_ENV === 'production' || fs.existsSync(path.join(__dirname, '.env.production'))
-  ? '.env.production'
-  : '.env'
+const preferredEnvFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env'
+const envFile = fs.existsSync(path.join(__dirname, preferredEnvFile)) ? preferredEnvFile : '.env'
 
 require('dotenv').config({ path: path.join(__dirname, envFile) })
 
@@ -214,7 +213,7 @@ const logger = {
 }
 
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./.wa_auth')
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
   const { version } = await fetchLatestBaileysVersion().catch(() => ({
     version: [2, 3000, 1015901307],
@@ -311,6 +310,15 @@ function toWhatsAppJid(phone) {
   return phone + '@s.whatsapp.net'
 }
 
+function sanitizeWhatsAppText(message) {
+  return String(message)
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\bwww\.\S+/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 app.get('/status', (req, res) => {
   const fileStatus = readStatus()
   res.json({
@@ -390,9 +398,14 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const sent = await sock.sendMessage(jid, { text: message })
+    const text = sanitizeWhatsAppText(message)
+    if (!text) {
+      return res.status(400).json({ error: 'message is empty after removing links' })
+    }
+
+    const sent = await sock.sendMessage(jid, { text }, { linkPreview: false })
     if (sent?.key?.id) {
-      msgStore[sent.key.id] = { conversation: message }
+      msgStore[sent.key.id] = { conversation: text }
       saveMsgStore()
     }
     console.log(`[wa] Queued → ${phone} (awaiting delivery ACK)`)
