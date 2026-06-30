@@ -325,6 +325,16 @@ app.get('/status', (req, res) => {
     ready: isReady,
     status: isReady ? 'connected' : (latestQr ? 'qr' : (fileStatus || 'waiting')),
     hasQr: !isReady && !!latestQr,
+    uptime: Math.floor(process.uptime()),
+  })
+})
+
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    ready: isReady,
+    status: readStatus() || (isReady ? 'connected' : 'waiting'),
+    uptime: Math.floor(process.uptime()),
   })
 })
 
@@ -441,10 +451,39 @@ async function cronPost(url, label) {
 }
 
 
+function startKeepAwake(serverPort) {
+  const enabled = String(process.env.KEEP_ALIVE_ENABLED || 'true').toLowerCase() !== 'false'
+  if (!enabled) {
+    console.log('[keep-awake] Disabled by KEEP_ALIVE_ENABLED=false')
+    return
+  }
+
+  const intervalMs = Math.max(parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '240000', 10), 60_000)
+  const host = process.env.HOST || '0.0.0.0'
+  const localHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host
+  const url = process.env.KEEP_ALIVE_URL || `http://${localHost}:${serverPort}/healthz`
+
+  async function ping() {
+    try {
+      const res = await fetch(url, { cache: 'no-store' })
+      if (!res.ok) {
+        console.warn(`[keep-awake] Ping returned HTTP ${res.status}: ${url}`)
+      }
+    } catch (err) {
+      console.warn(`[keep-awake] Ping failed: ${err.message}`)
+    }
+  }
+
+  setInterval(ping, intervalMs)
+  setTimeout(ping, 10_000)
+  console.log(`[keep-awake] Pinging ${url} every ${Math.round(intervalMs / 1000)}s`)
+}
+
 function startServer(port, maxPort) {
   const host = process.env.HOST || '0.0.0.0'
   const server = app.listen(port, host, () => {
     console.log(`WhatsApp service HTTP running on ${host}:${port}`)
+    startKeepAwake(port)
   })
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE' && port < maxPort) {
