@@ -1,5 +1,6 @@
 const path = require('path')
 const fs = require('fs')
+const crypto = require('crypto')
 
 const preferredEnvFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env'
 const envFile = fs.existsSync(path.join(__dirname, preferredEnvFile)) ? preferredEnvFile : '.env'
@@ -46,6 +47,11 @@ const cron = require('node-cron')
 
 const app = express()
 app.use(express.json())
+
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000'
+const WEBHOOK_URL = process.env.WHATSAPP_STATUS_WEBHOOK_URL || `${BACKEND_URL}/api/v1/webhooks/whatsapp/status`
+const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || process.env.CRON_SECRET || ''
+const DOWN_GRACE_MS = Math.max(parseInt(process.env.WHATSAPP_DOWN_GRACE_MS || '60000', 10), 1000)
 
 // Shared files PHP reads to show QR status
 const STATUS_FILE = path.join(__dirname, 'wa_status.txt')
@@ -188,6 +194,8 @@ let isReady = false
 let latestQr = null
 let sock = null
 let settlingUntil = 0  // timestamp until which the session is still stabilising after reconnect
+let lifecycleStatus = null
+let downTimer = null
 
 // Silent logger — Baileys is extremely verbose by default
 // PreKeyError / SessionError / "failed to decrypt" are expected noise after a reconnect:
@@ -269,7 +277,12 @@ async function connectToWhatsApp() {
       writeStatus('waiting')
       const statusCode = lastDisconnect?.error?.output?.statusCode
       const loggedOut = statusCode === DisconnectReason.loggedOut
-      console.warn('[wa] Connection closed — status code:', statusCode)
+      console.warn('[wa] Connection closed:', JSON.stringify({
+        ...describeError(lastDisconnect?.error),
+        statusCode,
+        loggedOut,
+      }))
+      scheduleDownReport(lastDisconnect?.error)
       if (loggedOut) {
         clearAuthState()
         console.log('[wa] Logged out. A fresh session will be created automatically.')
@@ -284,12 +297,17 @@ async function connectToWhatsApp() {
         setTimeout(connectToWhatsApp, 10_000)
       }
     } else if (connection === 'open') {
+      if (downTimer) {
+        clearTimeout(downTimer)
+        downTimer = null
+      }
       isReady = true
       settlingUntil = Date.now() + 8_000  // give the Signal session 8s to fully stabilise
       latestQr = null
       writeStatus('connected')
       try { fs.unlinkSync(QR_FILE) } catch { }
       console.log('WhatsApp client ready — GMR messaging is now active')
+      reportLifecycle('up')
     }
   })
 }
@@ -317,6 +335,57 @@ function sanitizeWhatsAppText(message) {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function describeError(error) {
+  if (!error) return { message: 'unknown error' }
+  return {
+    name: error.name,
+    message: error.message,
+    statusCode: error.output?.statusCode,
+    stack: error.stack,
+  }
+}
+
+async function reportLifecycle(status, error) {
+  if (lifecycleStatus === status || !WEBHOOK_SECRET) return
+
+  const payload = {
+    status,
+    reason: status === 'down' ? 'connection_closed' : 'connection_open',
+    error_code: error?.output?.statusCode || null,
+    occurred_at: new Date().toISOString(),
+  }
+  const body = JSON.stringify(payload)
+  const timestamp = Math.floor(Date.now() / 1000).toString()
+  const signature = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex')
+
+  try {
+    const response = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Webhook-Signature': signature,
+        'X-Webhook-Timestamp': timestamp,
+      },
+      body,
+    })
+    if (!response.ok) {
+      console.warn(`[wa] Lifecycle webhook returned HTTP ${response.status}`)
+      return
+    }
+    lifecycleStatus = status
+  } catch (webhookError) {
+    console.warn('[wa] Lifecycle webhook failed:', webhookError.message)
+  }
+}
+
+function scheduleDownReport(error) {
+  if (downTimer) clearTimeout(downTimer)
+  downTimer = setTimeout(() => {
+    downTimer = null
+    reportLifecycle('down', error)
+  }, DOWN_GRACE_MS)
 }
 
 app.get('/status', (req, res) => {
@@ -421,13 +490,12 @@ app.post('/send', async (req, res) => {
     console.log(`[wa] Queued → ${phone} (awaiting delivery ACK)`)
     res.json({ sent: true, to: phone, message_id: sent?.key?.id || null })
   } catch (err) {
-    console.error(`[wa] Failed to send to ${phone}:`, err.message)
+    console.error(`[wa] Failed to send to ${phone}:`, JSON.stringify(describeError(err)))
     res.status(500).json({ error: err.message })
   }
 })
 
 // ─── Cron helpers ────────────────────────────────────────────────────────────
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000'
 const CRON_SECRET = process.env.CRON_SECRET || ''
 
 async function cronPost(url, label) {
