@@ -12,18 +12,22 @@ require('dotenv').config({ path: path.join(__dirname, envFile) })
 // "error in sending message again" on stale queued retries.
 const _NOISE_LOG = /Closing session|Opening session|Closing open session|Failed to decrypt message with any known session/i
 const _NOISE_ERR = /Session error|Bad MAC|PreKeyError|SessionError|failed to decrypt|No session record|Invalid PreKey|Timed Out|error in sending message again/i
+// Temporary escape hatch for diagnosing the "waiting for this message"
+// delivery issue — set WA_DEBUG_ALL=1 to see the real session/decrypt
+// errors this filter normally hides. Remove once diagnosed.
+const _DEBUG_ALL = process.env.WA_DEBUG_ALL === '1'
 
 const _log = console.log
 console.log = (...a) => {
   const first = typeof a[0] === 'string' ? a[0] : ''
-  if (_NOISE_LOG.test(first)) return
+  if (!_DEBUG_ALL && _NOISE_LOG.test(first)) return
   _log(...a)
 }
 
 const _err = console.error
 console.error = (...a) => {
   const s = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ')
-  if (_NOISE_ERR.test(s)) return
+  if (!_DEBUG_ALL && _NOISE_ERR.test(s)) return
   _err(...a)
 }
 
@@ -31,7 +35,7 @@ console.error = (...a) => {
 const _stdoutWrite = process.stdout.write.bind(process.stdout)
 process.stdout.write = (chunk, encoding, cb) => {
   const s = typeof chunk === 'string' ? chunk : chunk.toString()
-  if (_NOISE_LOG.test(s) || _NOISE_ERR.test(s)) {
+  if (!_DEBUG_ALL && (_NOISE_LOG.test(s) || _NOISE_ERR.test(s))) {
     if (typeof encoding === 'function') encoding()
     else if (typeof cb === 'function') cb()
     return true
@@ -46,7 +50,9 @@ const express = require('express')
 const cron = require('node-cron')
 
 const app = express()
-app.use(express.json())
+// Default (~100kb) is far too small for a base64-encoded report/certificate
+// PDF attachment sent via /send.
+app.use(express.json({ limit: '20mb' }))
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000'
 const WEBHOOK_URL = process.env.WHATSAPP_STATUS_WEBHOOK_URL || `${BACKEND_URL}/api/v1/webhooks/whatsapp/status`
@@ -448,10 +454,12 @@ app.post('/reset-auth', async (req, res) => {
 })
 
 app.post('/send', async (req, res) => {
-  const { phone, message } = req.body
+  const { phone, message, document, fileName, mimetype } = req.body
 
-  if (!phone || !message) {
-    return res.status(400).json({ error: 'phone and message are required' })
+  // A document send may carry no caption at all; a text-only send still
+  // requires a message.
+  if (!phone || (!message && !document)) {
+    return res.status(400).json({ error: 'phone and (message or document) are required' })
   }
 
   if (!isReady || !sock) {
@@ -477,17 +485,44 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const text = sanitizeWhatsAppText(message)
-    if (!text) {
-      return res.status(400).json({ error: 'message is empty after removing links' })
+    let sent
+    let storeEntry
+
+    if (document) {
+      let buffer
+      try {
+        buffer = Buffer.from(document, 'base64')
+      } catch {
+        return res.status(400).json({ error: 'document must be base64-encoded' })
+      }
+      if (!buffer.length) {
+        return res.status(400).json({ error: 'document is empty' })
+      }
+
+      const caption = message ? sanitizeWhatsAppText(message) : undefined
+
+      sent = await sock.sendMessage(jid, {
+        document: buffer,
+        fileName: fileName || 'document.pdf',
+        mimetype: mimetype || 'application/pdf',
+        caption,
+      })
+      storeEntry = { conversation: caption || fileName || 'document' }
+    } else {
+      const text = sanitizeWhatsAppText(message)
+      if (!text) {
+        return res.status(400).json({ error: 'message is empty after removing links' })
+      }
+
+      sent = await sock.sendMessage(jid, { text }, { linkPreview: false })
+      storeEntry = { conversation: text }
     }
 
-    const sent = await sock.sendMessage(jid, { text }, { linkPreview: false })
     if (sent?.key?.id) {
-      msgStore[sent.key.id] = { conversation: text }
+      msgStore[sent.key.id] = storeEntry
       saveMsgStore()
     }
-    console.log(`[wa] Queued → ${phone} (awaiting delivery ACK)`)
+    console.log(`[wa] Queued → ${phone} (${document ? 'document' : 'text'}, awaiting delivery ACK)`)
     res.json({ sent: true, to: phone, message_id: sent?.key?.id || null })
   } catch (err) {
     console.error(`[wa] Failed to send to ${phone}:`, JSON.stringify(describeError(err)))
