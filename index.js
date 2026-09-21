@@ -453,7 +453,74 @@ app.post('/reset-auth', async (req, res) => {
   }
 })
 
+// ─── Serialized send queue ──────────────────────────────────────────────
+// Baileys holds one Signal Protocol session per socket — sending several
+// messages/documents concurrently (e.g. a learner's transcript plus a
+// handful of distinction certificates, arriving as separate /send requests
+// close together once a learner has enough of them) races that shared
+// session state. That's exactly what the DECRYPT_NOISE filter above is
+// already hiding symptoms of (Bad MAC, SessionError, PreKeyError), and
+// concurrent large document uploads sharing one socket also just time out
+// under load. Every send — text or document, to any recipient — now goes
+// through this single FIFO queue so only one is ever in flight, with a
+// short settle delay after each one finishes before the next starts
+// (Baileys' internal session bookkeeping isn't fully done the instant
+// sendMessage's promise resolves).
+let sendQueue = Promise.resolve()
+const SEND_SETTLE_MS = Math.max(parseInt(process.env.WHATSAPP_SEND_SETTLE_MS || '1500', 10), 0)
+// If a send neither resolves nor rejects (a real Baileys/WebSocket failure
+// mode — a dropped connection doesn't always surface as an error), waiting
+// on it forever would wedge this entire FIFO: every send behind it, for
+// every recipient, would queue up permanently. Below Laravel's 120s
+// document HTTP timeout so PHP gets a real error response instead of its
+// own connection timeout firing first.
+const SEND_TASK_TIMEOUT_MS = Math.max(parseInt(process.env.WHATSAPP_SEND_TASK_TIMEOUT_MS || '90000', 10), 1000)
+
+function enqueueSend(task) {
+  const run = sendQueue.then(async () => {
+    const taskPromise = task()
+    // We stop *waiting* on taskPromise below if it doesn't settle in time,
+    // but we never cancel it (Baileys gives no way to). If it rejects late,
+    // after we've moved on, nothing would otherwise be listening — without
+    // this it's an unhandled rejection, which crashes recent Node by default.
+    taskPromise.catch(() => {})
+
+    let timeoutId
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Send timed out after ${SEND_TASK_TIMEOUT_MS}ms — a previous WhatsApp operation may be stuck`))
+      }, SEND_TASK_TIMEOUT_MS)
+    })
+
+    try {
+      return await Promise.race([taskPromise, timeoutPromise])
+    } finally {
+      clearTimeout(timeoutId)
+      if (SEND_SETTLE_MS > 0) {
+        await new Promise(resolve => setTimeout(resolve, SEND_SETTLE_MS))
+      }
+    }
+  })
+  // Keep the chain alive even when this task rejects, so one failed send
+  // doesn't stall every send queued behind it forever.
+  sendQueue = run.catch(() => {})
+  return run
+}
+
 app.post('/send', async (req, res) => {
+  // Opt-in auth: unlike /reset-auth (always locked down), /send stays open
+  // — matching today's behaviour — until WHATSAPP_SERVICE_SECRET (or
+  // CRON_SECRET) is actually set in this service's env, so deploying this
+  // check doesn't break Laravel until both sides are configured and
+  // restarted together.
+  const expectedSendSecret = process.env.WHATSAPP_SERVICE_SECRET || process.env.CRON_SECRET || ''
+  if (expectedSendSecret) {
+    const providedSendSecret = req.header('x-whatsapp-secret') || req.header('x-cron-secret') || ''
+    if (providedSendSecret !== expectedSendSecret) {
+      return res.status(403).json({ error: 'Forbidden' })
+    }
+  }
+
   const { phone, message, document, fileName, mimetype } = req.body
 
   // A document send may carry no caption at all; a text-only send still
@@ -484,39 +551,42 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: `Invalid SA phone number: ${phone} (normalised to ${digits})` })
   }
 
-  try {
-    let sent
-    let storeEntry
-
-    if (document) {
-      let buffer
-      try {
-        buffer = Buffer.from(document, 'base64')
-      } catch {
-        return res.status(400).json({ error: 'document must be base64-encoded' })
-      }
-      if (!buffer.length) {
-        return res.status(400).json({ error: 'document is empty' })
-      }
-
-      const caption = message ? sanitizeWhatsAppText(message) : undefined
-
-      sent = await sock.sendMessage(jid, {
-        document: buffer,
-        fileName: fileName || 'document.pdf',
-        mimetype: mimetype || 'application/pdf',
-        caption,
-      })
-      storeEntry = { conversation: caption || fileName || 'document' }
-    } else {
-      const text = sanitizeWhatsAppText(message)
-      if (!text) {
-        return res.status(400).json({ error: 'message is empty after removing links' })
-      }
-
-      sent = await sock.sendMessage(jid, { text }, { linkPreview: false })
-      storeEntry = { conversation: text }
+  // Validate up front, before this request even joins the send queue, so a
+  // bad payload fails fast instead of waiting in line behind other sends.
+  let buffer = null
+  let text = null
+  if (document) {
+    try {
+      buffer = Buffer.from(document, 'base64')
+    } catch {
+      return res.status(400).json({ error: 'document must be base64-encoded' })
     }
+    if (!buffer.length) {
+      return res.status(400).json({ error: 'document is empty' })
+    }
+  } else {
+    text = sanitizeWhatsAppText(message)
+    if (!text) {
+      return res.status(400).json({ error: 'message is empty after removing links' })
+    }
+  }
+
+  try {
+    const { sent, storeEntry } = await enqueueSend(async () => {
+      if (document) {
+        const caption = message ? sanitizeWhatsAppText(message) : undefined
+        const sentMsg = await sock.sendMessage(jid, {
+          document: buffer,
+          fileName: fileName || 'document.pdf',
+          mimetype: mimetype || 'application/pdf',
+          caption,
+        })
+        return { sent: sentMsg, storeEntry: { conversation: caption || fileName || 'document' } }
+      }
+
+      const sentMsg = await sock.sendMessage(jid, { text }, { linkPreview: false })
+      return { sent: sentMsg, storeEntry: { conversation: text } }
+    })
 
     if (sent?.key?.id) {
       msgStore[sent.key.id] = storeEntry
