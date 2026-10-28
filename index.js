@@ -43,7 +43,7 @@ process.stdout.write = (chunk, encoding, cb) => {
   return _stdoutWrite(chunk, encoding, cb)
 }
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, isJidGroup, isJidNewsletter } = require('@whiskeysockets/baileys')
 const qrcode = require('qrcode-terminal')
 const QRCode = require('qrcode')
 const express = require('express')
@@ -56,6 +56,7 @@ app.use(express.json({ limit: '20mb' }))
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000'
 const WEBHOOK_URL = process.env.WHATSAPP_STATUS_WEBHOOK_URL || `${BACKEND_URL}/api/v1/webhooks/whatsapp/status`
+const DELIVERY_WEBHOOK_URL = process.env.WHATSAPP_WEBHOOK_URL || `${BACKEND_URL}/api/v1/webhooks/whatsapp/delivery`
 const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || process.env.CRON_SECRET || ''
 const DOWN_GRACE_MS = Math.max(parseInt(process.env.WHATSAPP_DOWN_GRACE_MS || '60000', 10), 1000)
 
@@ -64,6 +65,34 @@ const STATUS_FILE = path.join(__dirname, 'wa_status.txt')
 const QR_FILE = path.join(__dirname, 'wa_qr.png')
 const AUTH_DIR = path.join(__dirname, '.wa_auth')
 const LOCK_FILE = path.join(__dirname, '.wa_service.lock')
+const IDEMPOTENCY_FILE = path.join(__dirname, 'wa_send_idempotency.json')
+const inFlightSends = new Map()
+let completedSends = {}
+let sendQueueBlocked = false
+try {
+  completedSends = JSON.parse(fs.readFileSync(IDEMPOTENCY_FILE, 'utf8'))
+} catch { }
+
+function persistCompletedSends() {
+  try {
+    const allEntries = Object.entries(completedSends)
+    const uncertainEntries = allEntries.filter(([, result]) => result.status === 'unknown')
+    const successfulEntries = allEntries.filter(([, result]) => result.status !== 'unknown').slice(-2000)
+    const entries = [...successfulEntries, ...uncertainEntries]
+    completedSends = Object.fromEntries(entries)
+    const temporaryFile = `${IDEMPOTENCY_FILE}.tmp`
+    fs.writeFileSync(temporaryFile, JSON.stringify(completedSends), { mode: 0o600 })
+    fs.renameSync(temporaryFile, IDEMPOTENCY_FILE)
+    return true
+  } catch (err) {
+    console.error('[wa] Could not persist send idempotency records:', err.message)
+    return false
+  }
+}
+
+function expectedServiceSecret() {
+  return process.env.WHATSAPP_SERVICE_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET || process.env.CRON_SECRET || ''
+}
 
 function writeStatus(status) {
   try { fs.writeFileSync(STATUS_FILE, status, 'utf8') } catch { }
@@ -240,6 +269,16 @@ async function connectToWhatsApp() {
     browser: ['GMR Server', 'Chrome', '1.0.0'],
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
+    // This service only sends. WhatsApp Status updates, groups, channels and
+    // broadcast lists are acknowledged without being decrypted: after the
+    // service had been offline, decrypting that backlog froze it for 30s+
+    // (libsignal key derivation is slow, very slow on newer Node), WhatsApp
+    // dropped the connection (408), the backlog came back, and it never caught
+    // up — so report messages failed with "not connected". Direct chats are
+    // still handled, so delivery ticks keep working.
+    shouldIgnoreJid: jid => isJidBroadcast(jid) || isJidGroup(jid) || isJidNewsletter(jid),
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
     getMessage: async (key) => {
       return msgStore[key.id] || { conversation: '' }
     },
@@ -254,7 +293,8 @@ async function connectToWhatsApp() {
     saveMsgStore()
   })
 
-  // Track actual delivery — status 2=server ACK, 3=delivered to device, 4=read
+  // Forward actual delivery status to Laravel so notification audit records
+  // can distinguish queued, delivered, read, and failed messages.
   const STATUS_LABEL = { 0: 'ERROR', 1: 'PENDING', 2: 'SERVER_ACK', 3: 'DELIVERED', 4: 'READ', 5: 'PLAYED' }
   sock.ev.on('messages.update', (updates) => {
     for (const { key, update } of updates) {
@@ -262,6 +302,16 @@ async function connectToWhatsApp() {
         const label = STATUS_LABEL[update.status] ?? `STATUS_${update.status}`
         const recipient = key.remoteJid?.split('@')[0] ?? '?'
         console.log(`[wa] Delivery update → ${recipient}: ${label}`)
+        const status = update.status === 0
+          ? 'failed'
+          : update.status >= 4
+            ? 'read'
+            : update.status >= 3
+              ? 'delivered'
+              : 'queued'
+        setTimeout(() => {
+          reportDeliveryStatus(key, status, update.status === 0 ? update.error?.message || 'WhatsApp reported a send failure' : null)
+        }, 1000)
       }
     }
   })
@@ -336,11 +386,49 @@ function toWhatsAppJid(phone) {
 
 function sanitizeWhatsAppText(message) {
   return String(message)
-    .replace(/https?:\/\/\S+/gi, '')
-    .replace(/\bwww\.\S+/gi, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+async function reportDeliveryStatus(key, status, error) {
+  if (!WEBHOOK_SECRET || !key?.id) return
+
+  const payload = {
+    message_id: key.id,
+    phone: key.remoteJid?.split('@')[0] ?? '',
+    status,
+    timestamp: new Date().toISOString(),
+    error: error || null,
+  }
+  const body = JSON.stringify(payload)
+  const timestamp = Math.floor(Date.now() / 1000).toString()
+  const signature = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex')
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const response = await fetch(DELIVERY_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Webhook-Signature': signature,
+          'X-Webhook-Timestamp': timestamp,
+        },
+        body,
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (response.ok) return
+      if (response.status < 500) {
+        const detail = (await response.text()).slice(0, 300)
+        console.warn(`[wa] Delivery webhook returned HTTP ${response.status} for ${key.id}: ${detail}`)
+        return
+      }
+      console.warn(`[wa] Delivery webhook returned HTTP ${response.status} for ${key.id}; retry ${attempt + 1}/4`)
+    } catch (webhookError) {
+      console.warn(`[wa] Delivery webhook failed for ${key.id}; retry ${attempt + 1}/4:`, webhookError.message)
+    }
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)))
+  }
 }
 
 function describeError(error) {
@@ -397,8 +485,8 @@ function scheduleDownReport(error) {
 app.get('/status', (req, res) => {
   const fileStatus = readStatus()
   res.json({
-    ready: isReady,
-    status: isReady ? 'connected' : (latestQr ? 'qr' : (fileStatus || 'waiting')),
+    ready: isReady && !sendQueueBlocked,
+    status: sendQueueBlocked ? 'send_stalled' : (isReady ? 'connected' : (latestQr ? 'qr' : (fileStatus || 'waiting'))),
     hasQr: !isReady && !!latestQr,
     uptime: Math.floor(process.uptime()),
   })
@@ -407,8 +495,8 @@ app.get('/status', (req, res) => {
 app.get('/healthz', (req, res) => {
   res.json({
     ok: true,
-    ready: isReady,
-    status: readStatus() || (isReady ? 'connected' : 'waiting'),
+    ready: isReady && !sendQueueBlocked,
+    status: sendQueueBlocked ? 'send_stalled' : (readStatus() || (isReady ? 'connected' : 'waiting')),
     uptime: Math.floor(process.uptime()),
   })
 })
@@ -416,6 +504,17 @@ app.get('/healthz', (req, res) => {
 // Returns the QR as a raw PNG image (for PHP to fetch and embed)
 // 200 = QR image, 204 = connected (no content), 202 = not ready yet
 app.get('/qr.png', async (req, res) => {
+  // Whoever scans this QR takes over the school's WhatsApp number, so it is
+  // protected by the same shared secret as /send once one is configured.
+  const expectedQrSecret = expectedServiceSecret()
+  if (!expectedQrSecret) {
+    return res.status(503).json({ error: 'WhatsApp service authentication is not configured' })
+  }
+  const providedQrSecret = req.header('x-whatsapp-secret') || req.header('x-cron-secret') || ''
+  if (providedQrSecret !== expectedQrSecret) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
   if (isReady) return res.status(204).end()
   if (!latestQr) {
     try {
@@ -436,7 +535,7 @@ app.get('/qr.png', async (req, res) => {
 })
 
 app.post('/reset-auth', async (req, res) => {
-  const expected = process.env.CRON_SECRET || process.env.WHATSAPP_SERVICE_SECRET || ''
+  const expected = expectedServiceSecret()
   const provided = req.header('x-cron-secret') || req.header('x-whatsapp-secret') || ''
 
   if (!expected || provided !== expected) {
@@ -468,26 +567,30 @@ app.post('/reset-auth', async (req, res) => {
 // sendMessage's promise resolves).
 let sendQueue = Promise.resolve()
 const SEND_SETTLE_MS = Math.max(parseInt(process.env.WHATSAPP_SEND_SETTLE_MS || '1500', 10), 0)
-// If a send neither resolves nor rejects (a real Baileys/WebSocket failure
-// mode — a dropped connection doesn't always surface as an error), waiting
-// on it forever would wedge this entire FIFO: every send behind it, for
-// every recipient, would queue up permanently. Below Laravel's 120s
-// document HTTP timeout so PHP gets a real error response instead of its
-// own connection timeout firing first.
+// If a send never settles, the HTTP caller gets a bounded error and the
+// idempotency record prevents a blind retry. The FIFO remains blocked behind
+// that operation so a late Baileys send cannot overlap another message.
 const SEND_TASK_TIMEOUT_MS = Math.max(parseInt(process.env.WHATSAPP_SEND_TASK_TIMEOUT_MS || '90000', 10), 1000)
 
-function enqueueSend(task) {
+function enqueueSend(task, onTaskSettled = () => {}) {
+  let taskPromise = null
   const run = sendQueue.then(async () => {
-    const taskPromise = task()
+    taskPromise = task()
     // We stop *waiting* on taskPromise below if it doesn't settle in time,
     // but we never cancel it (Baileys gives no way to). If it rejects late,
     // after we've moved on, nothing would otherwise be listening — without
     // this it's an unhandled rejection, which crashes recent Node by default.
+    taskPromise.then(
+      result => onTaskSettled(null, result),
+      error => onTaskSettled(error),
+    )
     taskPromise.catch(() => {})
 
     let timeoutId
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
+        sendQueueBlocked = true
+        writeStatus('send_stalled')
         reject(new Error(`Send timed out after ${SEND_TASK_TIMEOUT_MS}ms — a previous WhatsApp operation may be stuck`))
       }, SEND_TASK_TIMEOUT_MS)
     })
@@ -503,34 +606,44 @@ function enqueueSend(task) {
   })
   // Keep the chain alive even when this task rejects, so one failed send
   // doesn't stall every send queued behind it forever.
-  sendQueue = run.catch(() => {})
+  // If Baileys ignores its timeout and keeps running, keep the FIFO blocked
+  // until that operation settles. Advancing would allow overlapping sends on
+  // one Signal session and an eventual duplicate after a Laravel retry.
+  sendQueue = run.catch(async () => {
+    if (taskPromise) await taskPromise.catch(() => {})
+    sendQueueBlocked = false
+    writeStatus(isReady ? 'connected' : 'waiting')
+  })
   return run
 }
 
 app.post('/send', async (req, res) => {
-  // Opt-in auth: unlike /reset-auth (always locked down), /send stays open
-  // — matching today's behaviour — until WHATSAPP_SERVICE_SECRET (or
-  // CRON_SECRET) is actually set in this service's env, so deploying this
-  // check doesn't break Laravel until both sides are configured and
-  // restarted together.
-  const expectedSendSecret = process.env.WHATSAPP_SERVICE_SECRET || process.env.CRON_SECRET || ''
-  if (expectedSendSecret) {
-    const providedSendSecret = req.header('x-whatsapp-secret') || req.header('x-cron-secret') || ''
-    if (providedSendSecret !== expectedSendSecret) {
-      return res.status(403).json({ error: 'Forbidden' })
-    }
+  // Keep sends private. The service returns an explicit configuration error
+  // instead of accepting unauthenticated requests when no key is configured.
+  const expectedSendSecret = expectedServiceSecret()
+  if (!expectedSendSecret) {
+    return res.status(503).json({ error: 'WhatsApp service authentication is not configured' })
+  }
+  const providedSendSecret = req.header('x-whatsapp-secret') || req.header('x-cron-secret') || ''
+  if (providedSendSecret !== expectedSendSecret) {
+    return res.status(403).json({ error: 'Forbidden' })
   }
 
-  const { phone, message, document, fileName, mimetype } = req.body
+  const body = req.body && typeof req.body === 'object' ? req.body : {}
+  const { phone, message, document, fileName, mimetype } = body
 
   // A document send may carry no caption at all; a text-only send still
   // requires a message.
-  if (!phone || (!message && !document)) {
+  if (typeof phone !== 'string' || !phone.trim() || (!message && !document)) {
     return res.status(400).json({ error: 'phone and (message or document) are required' })
   }
 
   if (!isReady || !sock) {
     return res.status(503).json({ error: 'WhatsApp client not connected — scan the QR code first' })
+  }
+
+  if (sendQueueBlocked) {
+    return res.status(503).json({ error: 'A previous send is still resolving; this request can be retried safely later' })
   }
 
   const remaining = settlingUntil - Date.now()
@@ -567,12 +680,47 @@ app.post('/send', async (req, res) => {
   } else {
     text = sanitizeWhatsAppText(message)
     if (!text) {
-      return res.status(400).json({ error: 'message is empty after removing links' })
+      return res.status(400).json({ error: 'message is empty' })
     }
   }
 
-  try {
-    const { sent, storeEntry } = await enqueueSend(async () => {
+  const requestKey = req.header('idempotency-key')
+  if (!requestKey || !/^[A-Za-z0-9._:-]{1,150}$/.test(requestKey)) {
+    return res.status(400).json({ error: 'A valid Idempotency-Key header is required' })
+  }
+  const payloadHash = crypto.createHash('sha256').update(JSON.stringify({
+    jid,
+    message: text,
+    documentHash: buffer ? crypto.createHash('sha256').update(buffer).digest('hex') : null,
+    fileName: fileName || null,
+    mimetype: mimetype || null,
+  })).digest('hex')
+
+  const completed = completedSends[requestKey]
+  if (completed) {
+    if (completed.payloadHash !== payloadHash) {
+      return res.status(409).json({ error: 'Idempotency key was already used for different message content' })
+    }
+    if (completed.status === 'unknown') {
+      return res.status(409).json({ error: 'The earlier send has an unknown outcome; check delivery logs before retrying' })
+    }
+    return res.json({ sent: true, to: completed.to, message_id: completed.message_id, duplicate: true })
+  }
+
+  const inFlight = inFlightSends.get(requestKey)
+  if (inFlight) {
+    if (inFlight.payloadHash !== payloadHash) {
+      return res.status(409).json({ error: 'Idempotency key is already being used for different message content' })
+    }
+    try {
+      const sent = await inFlight.promise
+      return res.json({ sent: true, to: sent.to, message_id: sent.message_id, duplicate: true })
+    } catch (err) {
+      return res.status(500).json({ error: err.message })
+    }
+  }
+
+  const sendPromise = enqueueSend(async () => {
       if (document) {
         const caption = message ? sanitizeWhatsAppText(message) : undefined
         const sentMsg = await sock.sendMessage(jid, {
@@ -584,17 +732,54 @@ app.post('/send', async (req, res) => {
         return { sent: sentMsg, storeEntry: { conversation: caption || fileName || 'document' } }
       }
 
-      const sentMsg = await sock.sendMessage(jid, { text }, { linkPreview: false })
+      const sentMsg = await sock.sendMessage(jid, { text })
       return { sent: sentMsg, storeEntry: { conversation: text } }
+    }, (error, outcome) => {
+      const record = completedSends[requestKey]
+      if (!record || record.status !== 'unknown') return
+      if (error) {
+        delete completedSends[requestKey]
+      } else {
+        const messageId = outcome?.sent?.key?.id || null
+        if (messageId) {
+          msgStore[messageId] = outcome.storeEntry
+          saveMsgStore()
+        }
+        completedSends[requestKey] = { payloadHash, status: 'sent', to: phone, message_id: messageId }
+      }
+      persistCompletedSends()
     })
+  // Persist an unknown state before doing network I/O. If this process stops
+  // during the send, a Laravel retry must not send the same notification a
+  // second time after restart. Success replaces this state with the message ID.
+  completedSends[requestKey] = { payloadHash, status: 'unknown', to: phone, message_id: null }
+  if (!persistCompletedSends()) {
+    delete completedSends[requestKey]
+    return res.status(503).json({ error: 'Could not safely record this send request; please retry later' })
+  }
+  inFlightSends.set(requestKey, { payloadHash, promise: sendPromise })
 
+  try {
+    const { sent, storeEntry } = await sendPromise
     if (sent?.key?.id) {
       msgStore[sent.key.id] = storeEntry
       saveMsgStore()
     }
-    console.log(`[wa] Queued → ${phone} (${document ? 'document' : 'text'}, awaiting delivery ACK)`)
+    const result = { payloadHash, status: 'sent', to: phone, message_id: sent?.key?.id || null }
+    completedSends[requestKey] = result
+    persistCompletedSends()
+    inFlightSends.delete(requestKey)
+    console.log(`[wa] Accepted by WhatsApp → ${phone} (${document ? 'document' : 'text'}, awaiting delivery ACK)`)
     res.json({ sent: true, to: phone, message_id: sent?.key?.id || null })
   } catch (err) {
+    inFlightSends.delete(requestKey)
+    if (err.message.includes('Send timed out')) {
+      completedSends[requestKey] = { payloadHash, status: 'unknown', to: phone, message_id: null }
+      persistCompletedSends()
+    } else {
+      delete completedSends[requestKey]
+      persistCompletedSends()
+    }
     console.error(`[wa] Failed to send to ${phone}:`, JSON.stringify(describeError(err)))
     res.status(500).json({ error: err.message })
   }
