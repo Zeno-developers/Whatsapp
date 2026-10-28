@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [ -f ".env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . ".env"
+  set +a
+fi
+
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:$HOME/.nodenv/shims:$HOME/.nvm/versions/node/*/bin"
 
 for profile in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
@@ -24,6 +31,12 @@ fi
 
 find_node_bin() {
   local candidate
+  if [[ -n "${NODE_BIN:-}" ]]; then
+    if [[ -x "$NODE_BIN" ]]; then
+      printf '%s\n' "$NODE_BIN"
+      return 0
+    fi
+  fi
   if command -v node >/dev/null 2>&1; then
     command -v node
     return 0
@@ -35,7 +48,7 @@ find_node_bin() {
     /usr/bin/node \
     /usr/local/bin/node \
     /opt/node/bin/node; do
-    if [ -x "$candidate" ]; then
+    if [[ -x "$candidate" ]]; then
       printf '%s\n' "$candidate"
       return 0
     fi
